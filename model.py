@@ -15,6 +15,9 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from einops import rearrange
+import xformers.ops as xops
+
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -27,67 +30,12 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        return y
-
-
-class DilatedCausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        self.dilation = config.dilation
-        self.segment_size = config.segment_size
-
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(
             config.n_embd, 3 * config.n_embd, bias=config.bias)
@@ -96,7 +44,9 @@ class DilatedCausalSelfAttention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.dropout = config.dropout
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional,
                              'scaled_dot_product_attention')
@@ -107,64 +57,160 @@ class DilatedCausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
-    def get_mask(self, i, j):
-        """i = row, j=column"""
-        return torch.ones((i, j), device=self.bias.device, dtype=torch.bool).triu(j - i + 2)
-
     def forward(self, x):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-        # Dilated attention mechanism
-        padding_len = -T % self.segment_size
-        # pad the sequence to make it a multiple of segment size
-        x = F.pad(x, (0, 0, 0, padding_len))
-        T = T + padding_len
-
-        # Split and sparsify
-        x = x.view(B, -1, self.segment_size, C) # (B, T, C) -> (B, T//segment_size, segment_size, C)    
-        x = x[:, :, ::self.dilation, :] # (B, T//segment_size, segment_size, C) -> (B, T//segment_size, segment_size//dilation, C)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=3) # (B, T//segment_size, segment_size//dilation, 3 * C // n_head)
-        k = k.contiguous().view(B, -1, self.n_head, self.segment_size //
-                            self.dilation, C // self.n_head).transpose(1, 2) # (B, nh, T//segment_size, segment_size//dilation, C // nh)
-        q = q.contiguous().view(B, -1, self.n_head, self.segment_size //
-                                self.dilation, C // self.n_head).transpose(1, 2)
-        v = v.contiguous().view(B, -1, self.n_head, self.segment_size //
-                                self.dilation, C // self.n_head).transpose(1, 2)
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C //
+                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C //
+                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C //
+                   self.n_head).transpose(1, 2)  # (B, nh, T, hs)
 
-        # Causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1))) # (B, nh, T//segment_size, segment_size//dilation, C // nh) x (B, nh, T//segment_size, C // nh, segment_size//dilation) -> (B, nh, T//segment_size, segment_size//dilation, segment_size//dilation)
+            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            y = att @ v  # (B, nh, T//segment_size, segment_size//dilation, segment_size//dilation) x (B, nh, T//segment_size, segment_size//dilation, C // nh) -> (B, nh, T//segment_size, segment_size//dilation, C // nh)
-
-        # scatter the heads back to the sequence length and the head dimension back to the feature dimension
-        zeros = torch.zeros((B, self.n_head, T//self.segment_size, self.segment_size, C // self.n_head), device=x.device)
-        zeros[:, :, :, ::self.dilation, :] = y
-        y = zeros
-
+            y = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-
         return y
+
+
+class DilatedAttention(nn.Module):
+    """
+    Implement dilated, scaled dot product attention with softmax.
+
+    Arguments:
+    ---------
+        softmax_scale: The temperature to use for the softmax attention.
+                       (default: 1/sqrt(d_keys) where d_keys is computed at runtime)
+        attention_dropout: The dropout rate to apply to the attention (default: 0.0)
+    """
+
+    def __init__(self, segment_lengths, dilation_rates, softmax_scale=None, attention_dropout=0.0, op=None):
+        super().__init__()
+        if len(segment_lengths) != len(dilation_rates):
+            raise ValueError(
+                "segment_lengths and dilation_rates must have the same length")
+
+        self.segment_lengths = segment_lengths
+        self.dilation_rates = dilation_rates
+        self.softmax_scale = softmax_scale
+        self.dropout_p = attention_dropout
+        self.op = op
+
+    def forward(self, query, key, value, is_causal=False):
+        # Notation:
+        #   B - batch size
+        #   T - sequence length
+        #   H - number of heads
+        #   D - embedding dimension
+        #   S - segment length
+        #   R - dilation rate
+        #   G - group size (i.e., number of heads per segment length)
+        #
+        # Input shape of query, key, value: (B, T, H, D)
+        B, _, H, _ = query.shape
+        out = torch.zeros_like(query)
+
+        # Divide into groups for each dilation rate and segment length (the two lists have the same size)
+        num_groups = len(self.dilation_rates)
+        group_sizes = [H // num_groups] * num_groups
+
+        # Groups are not necessarily equal
+        for i in range(H % num_groups):
+            group_sizes[i] += 1
+
+        for i, (G, R, S) in enumerate(zip(group_sizes, self.dilation_rates, self.segment_lengths)):
+            # Split the input sequences into segments of length 'S'
+            q = rearrange(query, "B (T S) H D -> B T S H D", S=S)
+            k = rearrange(key, "B (T S) H D -> B T S H D", S=S)
+            v = rearrange(value, "B (T S) H D -> B T S H D", S=S)
+            # Apply dilation and segment offset
+            offset = i % R
+            hmin = i * G
+            hmax = (i + 1) * G
+            q = q[:, :, offset::R, hmin:hmax, :]
+            k = k[:, :, offset::R, hmin:hmax, :]
+            v = v[:, :, offset::R, hmin:hmax, :]
+            # Fold all 'T' segments into the batch dimension
+            q = rearrange(q, "B T S H D -> (B T) S H D")
+            k = rearrange(k, "B T S H D -> (B T) S H D")
+            v = rearrange(v, "B T S H D -> (B T) S H D")
+
+            # Apply memory-efficient attention
+            attn_bias = xops.LowerTriangularMask() if is_causal else None
+            x = xops.memory_efficient_attention(
+                query=q, key=k, value=v, op=self.op, attn_bias=attn_bias)
+            # Unfold 'T' segments back out of the batch dimension
+            x = rearrange(x, "(B T) S H D -> B T S H D", B=B)
+            # Normalize attention outputs across the sequence length dimension
+            x = x / x.sum(dim=(1, 2), keepdim=True)
+
+            # Gather the attention outputs from each dilation rate / segment length
+            out = rearrange(out, "B (T S) H D -> B T S H D", S=S)
+            out[:, :, offset::R, hmin:hmax, :] += x
+            out = rearrange(out, "B T S H D -> B (T S) H D", S=S)
+
+        # Normalize across all attention outputs by dividing by the number of attention groups
+        return out / num_groups
+
+
+class MultiheadDilatedAttention(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # Key, query, value projections for all heads, but in a batch
+        self.c_attn = nn.Linear(
+            config.n_embd, 3 * config.n_embd, bias=config.bias)
+        # Output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+        # Regularization
+        self.resid_dropout = nn.Dropout(config.dropout)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+        self.attention = DilatedAttention(
+            segment_lengths=[2048, 2048, 2048, 2048],
+            dilation_rates=[1, 2, 4, 8],
+            attention_dropout=config.dropout
+        )
+
+    def forward(self, x):
+        B, T, D = x.size()  # Batch size, sequence length, embedding dimensionality (n_embd)
+
+        # Calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, D // self.n_head)  # (B, T, H, D)
+        q = q.view(B, T, self.n_head, D // self.n_head)  # (B, T, H, D)
+        v = v.view(B, T, self.n_head, D // self.n_head)  # (B, T, H, D)
+        y = self.attention(q, k, v, is_causal=True)
+        y = rearrange(y, 'B T H D -> B T (H D)')
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 
 class MLP(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_fc = nn.Linear(
+            config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU()
+        self.c_proj = nn.Linear(
+            4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -173,6 +219,7 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+
 
 class Block(nn.Module):
 
@@ -188,15 +235,19 @@ class Block(nn.Module):
         x = x + self.mlp(self.ln_2(x))
         return x
 
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
+    vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = True
+
 
 class GPT(nn.Module):
 
@@ -207,25 +258,27 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            wte=nn.Embedding(config.vocab_size, config.n_embd),
+            wpe=nn.Embedding(config.block_size, config.n_embd),
+            drop=nn.Dropout(config.dropout),
+            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         # with weight tying when using torch.compile() some warnings get generated:
         # "UserWarning: functional_call was passed multiple values for tied weights.
         # This behavior is deprecated and will be an error in future versions"
         # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        # https://paperswithcode.com/method/weight-tying
+        self.transformer.wte.weight = self.lm_head.weight
 
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
             if pn.endswith('c_proj.weight'):
-                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
+                torch.nn.init.normal_(
+                    p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
@@ -254,11 +307,13 @@ class GPT(nn.Module):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
+        pos = torch.arange(0, t, dtype=torch.long, device=device)  # shape (t)
 
         # forward the GPT model itself
-        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # token embeddings of shape (b, t, n_embd)
+        tok_emb = self.transformer.wte(idx)
+        # position embeddings of shape (t, n_embd)
+        pos_emb = self.transformer.wpe(pos)
         x = self.transformer.drop(tok_emb + pos_emb)
         for block in self.transformer.h:
             x = block(x)
@@ -267,10 +322,12 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+            # note: using list [-1] to preserve the time dim
+            logits = self.lm_head(x[:, [-1], :])
             loss = None
 
         return logits, loss
@@ -281,15 +338,17 @@ class GPT(nn.Module):
         # but want to use a smaller block size for some smaller, simpler model
         assert block_size <= self.config.block_size
         self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+        self.transformer.wpe.weight = nn.Parameter(
+            self.transformer.wpe.weight[:block_size])
         for block in self.transformer.h:
             if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+                block.attn.bias = block.attn.bias[:,
+                                                  :, :block_size, :block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):
         assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
-        override_args = override_args or {} # default to empty dict
+        override_args = override_args or {}  # default to empty dict
         # only dropout can be overridden see more notes below
         assert all(k == 'dropout' for k in override_args)
         from transformers import GPT2LMHeadModel
@@ -297,15 +356,21 @@ class GPT(nn.Module):
 
         # n_layer, n_head and n_embd are determined from model_type
         config_args = {
-            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),  # 124M params
-            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024), # 350M params
-            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280), # 774M params
-            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600), # 1558M params
+            # 124M params
+            'gpt2':         dict(n_layer=12, n_head=12, n_embd=768),
+            # 350M params
+            'gpt2-medium':  dict(n_layer=24, n_head=16, n_embd=1024),
+            # 774M params
+            'gpt2-large':   dict(n_layer=36, n_head=20, n_embd=1280),
+            # 1558M params
+            'gpt2-xl':      dict(n_layer=48, n_head=25, n_embd=1600),
         }[model_type]
         print("forcing vocab_size=50257, block_size=1024, bias=True")
-        config_args['vocab_size'] = 50257 # always 50257 for GPT model checkpoints
-        config_args['block_size'] = 1024 # always 1024 for GPT model checkpoints
-        config_args['bias'] = True # always True for GPT model checkpoints
+        # always 50257 for GPT model checkpoints
+        config_args['vocab_size'] = 50257
+        # always 1024 for GPT model checkpoints
+        config_args['block_size'] = 1024
+        config_args['bias'] = True  # always True for GPT model checkpoints
         # we can override the dropout rate, if desired
         if 'dropout' in override_args:
             print(f"overriding dropout rate to {override_args['dropout']}")
@@ -315,7 +380,8 @@ class GPT(nn.Module):
         model = GPT(config)
         sd = model.state_dict()
         sd_keys = sd.keys()
-        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # discard this mask / buffer, not a param
+        # discard this mask / buffer, not a param
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]
 
         # init a huggingface/transformers model
         model_hf = GPT2LMHeadModel.from_pretrained(model_type)
@@ -323,12 +389,16 @@ class GPT(nn.Module):
 
         # copy while ensuring all of the parameters are aligned and match in names and shapes
         sd_keys_hf = sd_hf.keys()
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these, just a buffer
-        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # same, just the mask (buffer)
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(
+            '.attn.masked_bias')]  # ignore these, just a buffer
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith(
+            '.attn.bias')]  # same, just the mask (buffer)
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
+                      'mlp.c_fc.weight', 'mlp.c_proj.weight']
         # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
         # this means that we have to transpose these weights when we import them
-        assert len(sd_keys_hf) == len(sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        assert len(sd_keys_hf) == len(
+            sd_keys), f"mismatched keys: {len(sd_keys_hf)} != {len(sd_keys)}"
         for k in sd_keys_hf:
             if any(k.endswith(w) for w in transposed):
                 # special treatment for the Conv1D weights we need to transpose
@@ -358,13 +428,17 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
+        print(
+            f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
+        print(
+            f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available
-        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        fused_available = 'fused' in inspect.signature(
+            torch.optim.AdamW).parameters
         use_fused = fused_available and device_type == 'cuda'
         extra_args = dict(fused=True) if use_fused else dict()
-        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas, **extra_args)
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, **extra_args)
         print(f"using fused AdamW: {use_fused}")
 
         return optimizer
@@ -380,8 +454,8 @@ class GPT(nn.Module):
         flops_per_fwdbwd = flops_per_token * T
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
         # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0/dt) # per second
-        flops_promised = 312e12 # A100 GPU bfloat16 peak flops is 312 TFLOPS
+        flops_achieved = flops_per_iter * (1.0/dt)  # per second
+        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
         mfu = flops_achieved / flops_promised
         return mfu
 
@@ -394,7 +468,8 @@ class GPT(nn.Module):
         """
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            idx_cond = idx if idx.size(
+                1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
