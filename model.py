@@ -10,6 +10,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import math
 import inspect
 from dataclasses import dataclass
+from typing import Sequence
 
 import torch
 import torch.nn as nn
@@ -196,8 +197,6 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    dilation: int = 4 # dilation factor for the dilated causal self-attention
-    segment_size: int = 64 # segment size for the dilated causal self-attention
 
 class GPT(nn.Module):
 
