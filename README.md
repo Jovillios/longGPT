@@ -11,6 +11,12 @@ A project focused on training and experimenting with long-context language model
 
 This project extends the nanoGPT architecture to explore and experiment with long-context language modeling. It provides a simple and efficient implementation for training and fine-tuning language models with extended context windows.
 
+## Our contributions
+
+- Implement `DilatedAttention` and `MultiheadDilatedAttention`in `model.py`
+- Create a new model: `LongGPT` based on dilated attention block in `model.py`
+- Visualize attention layers in `tests/test_attention.ipynb`
+
 ## Features
 
 - Efficient implementation of transformer-based language models
