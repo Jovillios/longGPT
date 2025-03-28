@@ -9,7 +9,7 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 
 import math
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Sequence
 
 import torch
@@ -17,6 +17,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from einops import rearrange
 import xformers.ops as xops
+from typing import List
 
 
 class LayerNorm(nn.Module):
@@ -236,6 +237,25 @@ class Block(nn.Module):
         return x
 
 
+
+class LongBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = MultiheadDilatedAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        self.mlp = MLP(config)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
+        return x
+
+
+
+
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -248,6 +268,11 @@ class GPTConfig:
     # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
     bias: bool = True
 
+    use_dilated: bool = True
+    segment_lengths: List[int] = field(default_factory=lambda: [2048, 2048, 2048, 2048])
+    dilation_rates: List[int] = field(default_factory=lambda: [1, 2, 4, 8])
+    
+
 
 class GPT(nn.Module):
 
@@ -257,11 +282,13 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        block_cls = LongBlock if config.use_dilated else Block
+        
         self.transformer = nn.ModuleDict(dict(
             wte=nn.Embedding(config.vocab_size, config.n_embd),
             wpe=nn.Embedding(config.block_size, config.n_embd),
             drop=nn.Dropout(config.dropout),
-            h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            h=nn.ModuleList([block_cls(config) for _ in range(config.n_layer)]),
             ln_f=LayerNorm(config.n_embd, bias=config.bias),
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
