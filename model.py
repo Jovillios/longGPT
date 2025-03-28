@@ -184,8 +184,8 @@ class MultiheadDilatedAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.attention = DilatedAttention(
-            segment_lengths=[2048, 2048, 2048, 2048],
-            dilation_rates=[1, 2, 4, 8],
+            segment_lengths=config.segment_lengths,
+            dilation_rates=config.dilation_rates,
             attention_dropout=config.dropout
         )
 
